@@ -1,0 +1,11 @@
+ticker,name,asset_class,weight
+SPY,S&P 500 ETF,Equity,0.28
+AGG,US Agg Bond ETF,Fixed Income,0.18
+GLD,Gold ETF,Commodity,0.05
+EFA,Intl Developed Equity,Equity,0.12
+EEM,EM Equity ETF,Equity,0.08
+VNQ,Real Estate ETF,Real Estate,0.05
+TLT,20yr Treasury ETF,Fixed Income,0.1
+LQD,Inv Grade Corp Bond,Fixed Income,0.07
+HYG,High Yield Bond ETF,Fixed Income,0.04
+DBC,Commodities ETF,Commodity,0.03
