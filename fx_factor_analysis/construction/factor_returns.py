@@ -1,7 +1,8 @@
 """
 Factor Return Construction
 ==========================
-Converts cross-sectional factor signals into long/short portfolio returns.
+Converts cross-sectional factor signals into daily long/short portfolio returns
+with monthly rebalancing.
 
 Methodology
 -----------
@@ -9,11 +10,12 @@ Methodology
 2. Pairs are ranked cross-sectionally by signal value.
 3. Top tercile  → long the foreign currency (long foreign / short USD)
 4. Bottom tercile → short the foreign currency (short foreign / long USD)
-5. Equal-weight within each leg.
-6. Factor return = average return of long leg - average return of short leg,
-   computed as the spot FX return from rebalance date t to t+1 (next month-end).
-7. Spot FX returns are already in foreign/USD convention, so a positive spot
-   return = the foreign currency appreciated = long foreign made money.
+5. Equal-weight within each leg; positions are constant between rebalance dates.
+6. Daily factor return = weighted sum of daily spot FX returns using the
+   positions set at the most recent month-end.
+   - Long leg contributes +1/n * daily_spot_return
+   - Short leg contributes -1/n * daily_spot_return
+7. Spot FX returns are in foreign/USD convention (positive = foreign appreciated).
 
 Public API
 ----------
@@ -80,17 +82,52 @@ def _rebalance_dates(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(sorted(set(snapped)))
 
 
-def _spot_monthly_returns(spot: pd.DataFrame, rebal_dates: pd.DatetimeIndex) -> pd.DataFrame:
+def _daily_spot_returns(spot: pd.DataFrame) -> pd.DataFrame:
+    """Daily simple returns for each pair. Return[t] = spot[t] / spot[t-1] - 1."""
+    return spot.pct_change()
+
+
+def _build_position_frame(
+    signal: pd.DataFrame,
+    rebal_dates: pd.DatetimeIndex,
+    daily_index: pd.DatetimeIndex,
+    n: int,
+) -> pd.DataFrame:
     """
-    Compute FX spot returns between consecutive rebalance dates.
-    Return[t] = spot[t+1] / spot[t] - 1, indexed at rebalance date t.
-    (i.e. the return earned by holding foreign currency from t to t+1)
+    Build a daily position DataFrame by:
+    1. Computing positions at each rebalance date from the signal.
+    2. Forward-filling those positions to cover every business day until
+       the next rebalance.
+
+    Positions are normalised so each leg sums to ±1 in absolute weight
+    (i.e. +1/n per long pair, -1/n per short pair), giving a zero-cost
+    long/short portfolio.
+
+    Returns
+    -------
+    pd.DataFrame
+        Shape (daily_index × pairs).  Values ∈ {-1/n, 0, +1/n}.
+        NaN where no signal was available.
     """
-    # Spot at each rebalance date
-    spot_at_rebal = spot.reindex(rebal_dates, method="ffill")
-    # Shift back: ret at date[i] = price[i+1] / price[i] - 1
-    fwd_ret = spot_at_rebal.shift(-1) / spot_at_rebal - 1.0
-    return fwd_ret  # NaN at the last date (no next period)
+    # --- Compute positions at each rebalance date ---
+    pos_at_rebal = pd.DataFrame(index=rebal_dates, columns=signal.columns, dtype=float)
+
+    for date in rebal_dates:
+        # Use the most recent available signal on or before this rebalance date
+        prior = signal.index[signal.index <= date]
+        if prior.empty:
+            pos_at_rebal.loc[date] = np.nan
+            continue
+        sig_row = signal.loc[prior[-1]]
+        raw_pos = _rank_signal(sig_row, n)
+        # Normalise: divide by n so each leg's total absolute weight = 1
+        pos_at_rebal.loc[date] = raw_pos / n
+
+    # --- Forward-fill to daily frequency ---
+    # Reindex to the full daily index; ffill carries each rebalance position
+    # forward until the next month-end.
+    pos_daily = pos_at_rebal.reindex(daily_index, method="ffill")
+    return pos_daily
 
 
 def _rank_signal(signal_row: pd.Series, n: int) -> pd.Series:
@@ -112,53 +149,39 @@ def _rank_signal(signal_row: pd.Series, n: int) -> pd.Series:
 
 def _compute_factor_return(
     signal: pd.DataFrame,
-    spot_monthly_ret: pd.DataFrame,
+    daily_spot_ret: pd.DataFrame,
     rebal_dates: pd.DatetimeIndex,
 ) -> pd.Series:
     """
-    For a single factor signal:
-    1. Sample signal at each rebalance date.
-    2. Rank → positions.
-    3. Multiply by next-period spot returns.
-    4. Average long leg - average short leg.
+    For a single factor:
+    1. Build daily position frame from monthly rebalance signals.
+    2. Daily factor return = sum(position_i * daily_spot_return_i) across all pairs.
+       Since positions are ±1/n, this equals:
+         mean(daily_ret of long pairs) - mean(daily_ret of short pairs)
+
+    The first day in each new holding period (the rebalance date itself) is
+    treated as a transition day: positions from the *previous* month are used
+    for that day's return, as the new signal is set at the close.
     """
     n = PortfolioParams.TERCILE_N
-    returns = []
-    dates = []
+    daily_index = daily_spot_ret.index
 
-    for date in rebal_dates[:-1]:  # last date has no forward return
-        if date not in signal.index:
-            # Find nearest prior signal date
-            prior = signal.index[signal.index <= date]
-            if prior.empty:
-                continue
-            date_sig = prior[-1]
-        else:
-            date_sig = date
+    pos_daily = _build_position_frame(signal, rebal_dates, daily_index, n)
 
-        sig_row = signal.loc[date_sig]
-        pos = _rank_signal(sig_row, n)
+    # Align positions and returns to the same columns
+    common_pairs = pos_daily.columns.intersection(daily_spot_ret.columns)
+    pos = pos_daily[common_pairs]
+    ret = daily_spot_ret[common_pairs]
 
-        # Forward return for this period
-        if date not in spot_monthly_ret.index:
-            continue
-        fwd = spot_monthly_ret.loc[date]
+    # Daily factor return: dot product of position vector and return vector
+    # (NaN pairs are excluded automatically via fillna(0) on positions)
+    factor_ret = (pos.fillna(0.0) * ret).sum(axis=1)
 
-        long_mask = pos == 1.0
-        short_mask = pos == -1.0
+    # Set to NaN on days where we had no valid position at all
+    no_position = pos.fillna(0.0).abs().sum(axis=1) == 0
+    factor_ret[no_position] = np.nan
 
-        long_ret = fwd[long_mask].mean() if long_mask.any() else np.nan
-        short_ret = fwd[short_mask].mean() if short_mask.any() else np.nan
-
-        if np.isnan(long_ret) or np.isnan(short_ret):
-            factor_ret = np.nan
-        else:
-            factor_ret = long_ret - short_ret
-
-        returns.append(factor_ret)
-        dates.append(date)
-
-    return pd.Series(returns, index=pd.DatetimeIndex(dates))
+    return factor_ret
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +190,7 @@ def _compute_factor_return(
 
 def build_all_factor_returns(data: FXFactorData) -> pd.DataFrame:
     """
-    Compute return series for all 11 FX factors.
+    Compute daily return series for all 11 FX factors with monthly rebalancing.
 
     Parameters
     ----------
@@ -177,15 +200,15 @@ def build_all_factor_returns(data: FXFactorData) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        Monthly factor returns.  Index = rebalance dates (business month-end).
+        Daily factor returns.  Index = all business days in the data.
         Columns = factor names (see FACTOR_SIGNAL_FUNCTIONS keys).
-        Values = long-minus-short portfolio return for that month.
+        Values = daily long-minus-short portfolio return.
     """
     pairs = [p for p in G10_PAIRS if p in data.spot.columns]
     spot = data.spot[pairs]
 
     rebal_dates = _rebalance_dates(spot.index)
-    spot_monthly_ret = _spot_monthly_returns(spot, rebal_dates)
+    daily_spot_ret = _daily_spot_returns(spot)
 
     all_returns: dict[str, pd.Series] = {}
 
@@ -193,9 +216,8 @@ def build_all_factor_returns(data: FXFactorData) -> pd.DataFrame:
         logger.info("Computing factor: %s", name)
         try:
             signal = fn(data)
-            # Restrict to our pair universe
             signal = signal[[c for c in pairs if c in signal.columns]]
-            factor_ret = _compute_factor_return(signal, spot_monthly_ret, rebal_dates)
+            factor_ret = _compute_factor_return(signal, daily_spot_ret, rebal_dates)
             all_returns[name] = factor_ret
         except Exception as e:
             logger.error("Failed to compute factor %s: %s", name, e)
@@ -206,7 +228,7 @@ def build_all_factor_returns(data: FXFactorData) -> pd.DataFrame:
     factor_returns = factor_returns.sort_index()
 
     logger.info(
-        "Factor returns computed: %d periods, %d factors.",
+        "Factor returns computed: %d daily observations, %d factors.",
         len(factor_returns),
         factor_returns.shape[1],
     )

@@ -109,7 +109,7 @@ def main() -> None:
     factor_returns = factor_returns[factor_returns.index >= analysis_start]
 
     logger.info(
-        "Output: %d monthly observations, %d factors, %d NaN cells.",
+        "Output: %d daily observations, %d factors, %d NaN cells.",
         len(factor_returns),
         factor_returns.shape[1],
         factor_returns.isna().sum().sum(),
